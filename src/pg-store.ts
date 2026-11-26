@@ -11,6 +11,7 @@ type DbEndpoint = {
   enabled: boolean; created_at: Date;
 };
 
+// Converts database field names and timestamps to the shape returned by the API.
 function toEndpoint(row: DbEndpoint): WebhookEndpoint {
   return {
     id: row.id,
@@ -22,13 +23,16 @@ function toEndpoint(row: DbEndpoint): WebhookEndpoint {
   };
 }
 
+// Keeps SQL in one place so routes and workers only deal with application data.
 export class PgStore implements Repository {
   constructor(private readonly pool: Pool) {}
 
+  // A real SQL ping, not an in-memory health flag.
   async ping(): Promise<void> {
     await this.pool.query("SELECT 1");
   }
 
+  // Login needs the hash; the API response must not expose it.
   async findUserByEmail(email: string): Promise<Account | null> {
     const result = await this.pool.query<{id: string; email: string; password_hash: string}>(
       "SELECT id, email, password_hash FROM users WHERE email = $1", [email]
@@ -37,6 +41,7 @@ export class PgStore implements Repository {
     return row ? { id: row.id, email: row.email, passwordHash: row.password_hash } : null;
   }
 
+  // Let the unique email constraint handle registration races.
   async createUser(email: string, passwordHash: string): Promise<Account> {
     const id = randomUUID();
     try {
@@ -51,6 +56,7 @@ export class PgStore implements Repository {
     return { id, email, passwordHash };
   }
 
+  // Saves a destination under its owner, including the secret used for signatures.
   async createEndpoint(userId: string, endpoint: NewWebhookEndpoint, secret: string): Promise<WebhookEndpoint> {
     const id = randomUUID();
     const result = await this.pool.query<DbEndpoint>(
@@ -62,6 +68,7 @@ export class PgStore implements Repository {
     return toEndpoint(result.rows[0]!);
   }
 
+  // Lists only the caller's destinations and leaves signing secrets out.
   async listEndpoints(userId: string): Promise<WebhookEndpoint[]> {
     const result = await this.pool.query<DbEndpoint>(
       `SELECT id, user_id, url, event_types, enabled, created_at
@@ -70,6 +77,7 @@ export class PgStore implements Repository {
     return result.rows.map(toEndpoint);
   }
 
+  // One transaction for the event and deliveries; duplicates return the original ID.
   async enqueueEvent(userId: string, event: NewEvent): Promise<QueuedEvent> {
     const client = await this.pool.connect();
     try {
@@ -114,6 +122,7 @@ export class PgStore implements Repository {
     }
   }
 
+  // Scope by user ID so tenants can't inspect each other's jobs.
   async listDeliveries(userId: string): Promise<DeliverySummary[]> {
     const result = await this.pool.query<{
       id: string; event_id: string; event_type: string; url: string;
@@ -136,6 +145,7 @@ export class PgStore implements Repository {
     }));
   }
 
+  // SKIP LOCKED keeps workers from claiming the same job at the same time.
   async claimDueDeliveries(limit: number): Promise<ClaimedDelivery[]> {
     const result = await this.pool.query<{
       id: string; event_id: string; attempts: number; event_type: string;
@@ -163,6 +173,7 @@ export class PgStore implements Repository {
     }));
   }
 
+  // Clear the last error once the receiver accepts the webhook.
   async markDelivered(id: string, responseCode: number): Promise<void> {
     await this.pool.query(
       `UPDATE deliveries SET status = 'delivered', response_code = $2, last_error = NULL,
@@ -170,6 +181,7 @@ export class PgStore implements Repository {
     );
   }
 
+  // No more retries once the maximum attempt count is reached.
   async markFailed(id: string, responseCode: number | null, reason: string): Promise<void> {
     await this.pool.query(
       `UPDATE deliveries SET status = 'failed', response_code = $2, last_error = $3,
@@ -177,6 +189,7 @@ export class PgStore implements Repository {
     );
   }
 
+  // Set next_attempt_at so the worker knows when to retry.
   async markRetrying(id: string, responseCode: number | null, reason: string, retryAt: Date): Promise<void> {
     await this.pool.query(
       `UPDATE deliveries SET status = 'retrying', response_code = $2, last_error = $3,

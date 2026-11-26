@@ -4,12 +4,14 @@ import { promisify } from "node:util";
 
 const scrypt = promisify(scryptCallback);
 
+// Saves a salted hash instead of a user's password.
 export async function hashPassword(password: string): Promise<string> {
   const salt = randomBytes(24).toString("hex");
   const hash = (await scrypt(password, salt, 64)) as Buffer;
   return `${salt}:${hash.toString("hex")}`;
 }
 
+// Login verification uses timingSafeEqual.
 export async function verifyPassword(password: string, stored: string): Promise<boolean> {
   const [salt, hex] = stored.split(":");
   if (!salt || !hex || !/^[0-9a-f]{128}$/i.test(hex)) return false;
@@ -18,15 +20,17 @@ export async function verifyPassword(password: string, stored: string): Promise<
   return timingSafeEqual(hash, original);
 }
 
+// Gives each webhook destination its own signing key.
 export function createSigningSecret(): string {
   return `whsec_${randomBytes(32).toString("hex")}`;
 }
 
+// Signs the exact outgoing body so the receiver can verify it.
 export function signWebhook(payload: string, secret: string): string {
   return `sha256=${createHmac("sha256", secret).update(payload).digest("hex")}`;
 }
 
-/** Rejects obvious private destinations. Production deployments also need DNS/egress enforcement. */
+// Block obvious private URLs here; DNS checks still belong at connection time.
 export function validateWebhookUrl(input: string): string {
   let parsed: URL;
   try {

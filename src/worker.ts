@@ -3,6 +3,7 @@ import { requiredDatabaseUrl } from "./config.js";
 import { processBatch } from "./dispatcher.js";
 import { PgStore } from "./pg-store.js";
 
+// The worker runs the queue loop until SIGINT or SIGTERM.
 async function main(): Promise<void> {
   const pool = new pg.Pool({ connectionString: requiredDatabaseUrl(), max: 5 });
   const store = new PgStore(pool);
