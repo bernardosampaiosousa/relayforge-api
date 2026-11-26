@@ -1,185 +1,127 @@
-# RelayForge API
+# RelayForge
 
-**Reliable webhook delivery with authentication, idempotency, signed payloads, and automatic retries.**
+A small webhook delivery service built with Fastify and PostgreSQL.
 
-RelayForge is a backend portfolio project that simulates the event-delivery infrastructure used by SaaS platforms. Developers create a webhook destination, publish an event once, and follow each delivery attempt through a small REST API. A separate worker signs outgoing requests and retries temporary failures with exponential backoff.
+The problem I wanted to solve was simple: an API sends an event, but the receiving server times out. The event shouldn't disappear, and two workers shouldn't send the same pending job at the same time.
 
-The application uses only synthetic examples. It is an original demonstration project, not code extracted from any company system.
+RelayForge stores events and deliveries in Postgres. A separate worker picks up pending jobs, signs each JSON body with HMAC-SHA256, and retries unsuccessful deliveries. This is a local demo, not a hosted webhook provider.
 
-## Technology
+## How the pieces fit
 
-- **Backend:** Node.js 22+, TypeScript, Fastify 5
-- **Database:** PostgreSQL 16, SQL migrations, transactions, parameterized queries
-- **Security:** JWT authentication, `scrypt` password hashes, HMAC-SHA256 delivery signatures
-- **API contract:** TypeBox JSON Schema and interactive OpenAPI/Swagger UI
-- **Reliability:** idempotency keys, `FOR UPDATE SKIP LOCKED` job claiming, retries, failed-delivery status
-- **Engineering:** Vitest tests, Docker Compose, TypeScript strict mode, GitHub Actions CI
+- **API:** register/login, create a webhook destination, publish an event, inspect recent deliveries
+- **Postgres:** stores accounts, destinations, events, and retry state
+- **Worker:** claims due deliveries with `FOR UPDATE SKIP LOCKED`, sends HTTPS requests, records the result
+- **Tests:** HTTP and worker tests without a database, plus an opt-in PostgreSQL integration suite
 
-## Architecture
+The service uses at-least-once delivery. If a worker crashes after sending a request but before saving its result, the receiver may see the same event again. The `x-relayforge-event-id` header is there to help receivers deduplicate it.
 
-```mermaid
-flowchart LR
-  Client[API client] --> API[Fastify REST API]
-  API --> DB[(PostgreSQL)]
-  Worker[Background worker] <--> DB
-  Worker -->|Signed HTTPS POST| Receiver[Webhook receiver]
-```
+## Start it
 
-The HTTP API and the worker run as separate processes. Publishing an event writes its deliveries in a database transaction. Workers atomically claim due deliveries, submit signed requests, and record success or schedule the next attempt. Delivery is **at least once**, so webhook consumers should also deduplicate incoming event IDs.
-
-## Quick start — Docker Compose
-
-**Requirements:** Docker Engine and Docker Compose.
+You'll need Docker Compose.
 
 ```bash
+git clone https://github.com/bernardosampaiosousa/relayforge-api.git
+cd relayforge-api
 cp .env.example .env
-```
-
-Generate a unique JWT secret:
-
-```bash
 openssl rand -hex 32
 ```
 
-Replace the `JWT_SECRET` value in `.env` with the generated secret. Then start the database, migration, API, and worker:
+Paste the generated value into `JWT_SECRET` in `.env`, then:
 
 ```bash
 docker compose up --build
 ```
 
-- API: <http://localhost:3000>
-- Swagger UI: <http://localhost:3000/docs>
-- Health check: <http://localhost:3000/health>
-- DB readiness: <http://localhost:3000/ready>
+- API: http://localhost:3000
+- Swagger: http://localhost:3000/docs
+- Health: http://localhost:3000/health
+- Database readiness: http://localhost:3000/ready
 
-The Postgres and API ports bind to `127.0.0.1` in the provided Compose setup. Stop services with `docker compose down`; a named volume preserves the database between restarts.
+The Compose database credentials are **local-development defaults**, and its port is bound to localhost. Don't reuse those credentials or this network setup for a public deployment.
 
-## Try the API
-
-1. **Register**, using a password of at least 12 characters:
-
-   ```bash
-   curl -X POST http://localhost:3000/auth/register \
-     -H 'content-type: application/json' \
-     -d '{"email":"demo@example.com","password":"change-this-demo-password"}'
-   ```
-
-   The response has a `token` (JWT). Set it in your shell:
-
-   ```bash
-   TOKEN='paste-token-here'
-   ```
-
-2. **Create a destination**. Replace the example URL with a public **HTTPS URL you control** to receive actual delivery attempts:
-
-   ```bash
-   curl -X POST http://localhost:3000/v1/endpoints \
-     -H "authorization: Bearer $TOKEN" \
-     -H 'content-type: application/json' \
-     -d '{"url":"https://example.com/webhooks","eventTypes":["order.created"]}'
-   ```
-
-   The response contains a `signingSecret`. It is returned at creation only; store it securely if you want to verify webhook signatures.
-
-3. **Publish an event**:
-
-   ```bash
-   curl -X POST http://localhost:3000/v1/events \
-     -H "authorization: Bearer $TOKEN" \
-     -H 'content-type: application/json' \
-     -d '{"type":"order.created","idempotencyKey":"demo-order-10001","payload":{"orderId":"10001","total":149.90}}'
-   ```
-
-   Repeating the same request with the same idempotency key returns the existing event ID and `"duplicate": true`. Reusing the key with different event data returns HTTP 409.
-
-4. **Inspect delivery results**:
-
-   ```bash
-   curl http://localhost:3000/v1/deliveries \
-     -H "authorization: Bearer $TOKEN"
-   ```
-
-   Example.com is a placeholder, not a test receiver: deliveries sent there will likely fail and retry. Use an HTTPS webhook testing endpoint or your own receiver to see successes.
-
-## Endpoint reference
-
-| Method | Path | Purpose | Auth |
-|---|---|---|---|
-| `GET` | `/health` | Liveness | No |
-| `GET` | `/ready` | Database readiness | No |
-| `POST` | `/auth/register` | Register an account | No |
-| `POST` | `/auth/login` | Obtain a JWT | No |
-| `POST` | `/v1/endpoints` | Create a webhook destination | Bearer JWT |
-| `GET` | `/v1/endpoints` | List own destinations, excluding secrets | Bearer JWT |
-| `POST` | `/v1/events` | Queue idempotent event deliveries | Bearer JWT |
-| `GET` | `/v1/deliveries` | Inspect own 100 latest deliveries | Bearer JWT |
-
-The OpenAPI definition is generated from the same JSON schemas used for request validation and response serialization.
-
-## Webhook signature
-
-Each outgoing JSON request includes:
-
-- `x-relayforge-event-id`: the stable event UUID
-- `x-relayforge-attempt`: attempt number, starting at 1
-- `x-relayforge-signature`: `sha256=<lowercase hexadecimal HMAC>`
-
-The HMAC-SHA256 is computed over the **exact raw JSON body** using the destination's `signingSecret`. Receivers should compute their own HMAC and compare the bytes using a constant-time comparison. Deliveries are successful for HTTP 2xx responses. Other statuses and network errors retry up to **5 attempts** with bounded exponential backoff, then move to the `failed` state.
-
-## Local development
-
-**Requirements:** Node.js 22+, npm, PostgreSQL 16 (or Docker for Postgres).
+You can also run the API and worker with Node.js 22+ against your own Postgres instance:
 
 ```bash
 npm ci
 cp .env.example .env
-# Generate and configure JWT_SECRET; set DATABASE_URL for your local DB.
 npm run db:migrate
 npm run dev
 ```
 
-Run the worker in another terminal:
+In a second terminal:
 
 ```bash
 npm run dev:worker
 ```
 
-Quality checks (tests use a fake repository and do not need a running database):
+## Send an event
+
+Register an account:
+
+```bash
+curl -X POST http://localhost:3000/auth/register \
+  -H 'content-type: application/json' \
+  -d '{"email":"demo@example.com","password":"a-local-demo-password"}'
+```
+
+The response includes a JWT. Put it in `TOKEN`:
+
+```bash
+TOKEN='your-jwt-token'
+```
+
+Create an HTTPS destination you control:
+
+```bash
+curl -X POST http://localhost:3000/v1/endpoints \
+  -H "authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"url":"https://your-domain.example/hooks","eventTypes":["order.created"]}'
+```
+
+The response includes a signing secret, shown only once. Keep it if you want to verify signatures in your receiver.
+
+Publish an event:
+
+```bash
+curl -X POST http://localhost:3000/v1/events \
+  -H "authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"type":"order.created","idempotencyKey":"order-10001","payload":{"orderId":"10001"}}'
+```
+
+Check the attempt history with `GET /v1/deliveries` and the same bearer token. A delivery succeeds on HTTP 2xx. Other responses and network errors are retried, up to five attempts, with a capped backoff.
+
+If you post the same event again with the same idempotency key and payload, you get the existing event ID. Changing the payload while reusing the key returns 409.
+
+## Design notes
+
+I used a separate worker instead of sending webhooks inside the API request because receivers may be slow or unreachable. Publishing the event and enqueuing deliveries happen in one transaction, so a failed write doesn't leave half an event behind.
+
+Two workers can poll at once because Postgres locks claimed rows. A job left in `processing` for over three minutes becomes eligible again. The delivery signature is calculated over the exact serialized JSON body, not a reconstructed object.
+
+Relevant files:
+
+- [`src/app.ts`](src/app.ts): routes and request schemas
+- [`src/pg-store.ts`](src/pg-store.ts): database queries and job claiming
+- [`src/dispatcher.ts`](src/dispatcher.ts): HTTP calls, signatures, retries
+- [`src/security.ts`](src/security.ts): passwords and webhook URL checks
+
+## Tests and limits
 
 ```bash
 npm run check
 npm run build
 ```
 
-## Design decisions and trade-offs
+For the PostgreSQL integration tests, use a **disposable** database ending in `_test`:
 
-- **Transactional enqueue:** an event and all its initial deliveries are persisted together; uniqueness is enforced by `(user_id, idempotency_key)`.
-- **Safe concurrent claiming:** PostgreSQL row locking with `SKIP LOCKED` prevents multiple workers from claiming the same available job simultaneously. A timed-out `processing` job can be reclaimed if a worker crashes, so recipients must support at-least-once delivery.
-- **Bounded retry:** five total attempts and a capped backoff reduce repeated pressure on a failing destination.
-- **Tenant separation:** endpoint and delivery reads are scoped by the signed-in user's ID; signing secrets do not appear in list responses.
-- **Controlled input:** JSON schemas limit payload size and allowed field types; endpoints must use HTTPS and cannot be obvious localhost, internal-domain, or literal-IP destinations.
-
-### Production hardening still required
-
-This is a **portfolio/demo API**, not a production webhook service. In production, also add DNS resolution and public-IP verification *at connection time*, network-level egress restrictions to mitigate SSRF and DNS rebinding, encrypted-at-rest signing secrets, full observability, fair scheduling and per-tenant quotas, key rotation, stronger operational recovery semantics, and database-backed/distributed rate limiting. Do not deploy it on an unrestricted public network as-is.
-
-## Project structure
-
-```text
-src/
-  app.ts          Fastify routes, schemas, Swagger, auth
-  pg-store.ts     PostgreSQL repository and transactions
-  dispatcher.ts   Signed HTTP delivery and retries
-  worker.ts       Background polling loop
-  security.ts     Password hashing, HMACs, URL validation
-  retry.ts        Retry policy
-scripts/migrate.ts
-sql/001_init.sql
-tests/             HTTP, security and delivery unit tests
-compose.yaml
-Dockerfile
+```bash
+TEST_DATABASE_URL=postgres://relayforge:your-password@127.0.0.1:5432/relayforge_test npm run test:integration
 ```
 
-## License
+Those tests clear tables in the test database. GitHub Actions runs them against a fresh PostgreSQL service.
 
-MIT — see [LICENSE](LICENSE).
+**Security boundary:** the URL validator rejects obvious private destinations, but it does not prevent DNS rebinding or all SSRF attacks. Do not run the worker with unrestricted public-network access. Before a production deployment, I'd add network-level egress controls, DNS/IP checks at connection time, encrypted signing secrets, delivery metrics, per-tenant quotas, and better worker recovery.
+
+MIT license.
