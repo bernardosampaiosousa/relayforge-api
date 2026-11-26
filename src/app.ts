@@ -44,6 +44,7 @@ interface AppOptions {
   logger?: boolean;
 }
 
+// Keep setup separate from listen() for Fastify's inject tests.
 export async function createApp({ repository, jwtSecret, logger = false }: AppOptions): Promise<FastifyInstance> {
   if (jwtSecret.length < 32) throw new Error("JWT secret must be at least 32 characters");
   const app = Fastify({ logger, bodyLimit: 64 * 1024 });
@@ -58,6 +59,7 @@ export async function createApp({ repository, jwtSecret, logger = false }: AppOp
   await app.register(jwt, { secret: jwtSecret, sign: { expiresIn: "2h" } });
   await app.register(rateLimit, { max: 100, timeWindow: "1 minute" });
 
+  // Turns expected errors into useful responses while hiding unexpected failures.
   app.setErrorHandler((error: FastifyError, request, reply) => {
     if (error.validation) {
       void reply.code(400).send({ error: "Validation failed", details: error.message });
@@ -72,9 +74,11 @@ export async function createApp({ repository, jwtSecret, logger = false }: AppOp
     void reply.code(statusCode).send({ error: statusCode >= 500 ? "Internal server error" : error.message });
   });
 
+  // /health is process-only; /ready handles database status.
   app.get("/health", { schema: { tags: ["System"], summary: "Liveness check" } },
     async () => ({ status: "ok" }));
 
+  // Return 503 if PostgreSQL can't respond.
   app.get("/ready", { schema: { tags: ["System"], summary: "Database readiness check" } }, async (_request, reply) => {
     try {
       await repository.ping();
@@ -84,6 +88,7 @@ export async function createApp({ repository, jwtSecret, logger = false }: AppOp
     }
   });
 
+  // Registers accounts with a password hash and returns a token for the first session.
   app.post<{ Body: Static<typeof credentialsSchema> }>("/auth/register", {
     schema: { tags: ["Authentication"], summary: "Create an account", body: credentialsSchema,
       response: { 201: authResponseSchema } },
@@ -96,6 +101,7 @@ export async function createApp({ repository, jwtSecret, logger = false }: AppOp
     return reply.code(201).send({ token, tokenType: "Bearer" });
   });
 
+  // Checks saved credentials before issuing a new access token.
   app.post<{ Body: Static<typeof credentialsSchema> }>("/auth/login", {
     schema: { tags: ["Authentication"], summary: "Sign in", body: credentialsSchema,
       response: { 200: authResponseSchema } },
@@ -109,10 +115,12 @@ export async function createApp({ repository, jwtSecret, logger = false }: AppOp
     return { token: app.jwt.sign({ sub: user.id, email: user.email }), tokenType: "Bearer" as const };
   });
 
+  // Verify the JWT before any user-scoped query.
   const authenticate = async (request: FastifyRequest): Promise<void> => {
     await request.jwtVerify();
   };
 
+  // Validates a destination and shows its signing secret only when it is created.
   app.post<{ Body: Static<typeof endpointInputSchema> }>("/v1/endpoints", {
     onRequest: authenticate,
     schema: { tags: ["Endpoints"], summary: "Register an HTTPS webhook destination", security: [{ bearerAuth: [] }],
@@ -131,12 +139,14 @@ export async function createApp({ repository, jwtSecret, logger = false }: AppOp
     return reply.code(201).send({ ...endpoint, signingSecret: secret });
   });
 
+  // Returns a user's destinations without exposing their signing keys.
   app.get("/v1/endpoints", {
     onRequest: authenticate,
     schema: { tags: ["Endpoints"], summary: "List my destinations (secrets omitted)",
       security: [{ bearerAuth: [] }], response: { 200: Type.Array(endpointSchema) } }
   }, async request => repository.listEndpoints(request.user.sub));
 
+  // Deduplicate client retries by idempotency key.
   app.post<{ Body: Static<typeof eventInputSchema> }>("/v1/events", {
     onRequest: authenticate,
     schema: { tags: ["Events"], summary: "Queue an event with an idempotency key",
@@ -147,6 +157,7 @@ export async function createApp({ repository, jwtSecret, logger = false }: AppOp
     return reply.code(202).send(result);
   });
 
+  // Shows recent attempts for the signed-in user to troubleshoot failed webhooks.
   app.get("/v1/deliveries", {
     onRequest: authenticate,
     schema: { tags: ["Deliveries"], summary: "View my latest 100 webhook deliveries", security: [{ bearerAuth: [] }],

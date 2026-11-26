@@ -1,9 +1,11 @@
+// Stops startup if the API or worker has no database connection string.
 export function requiredDatabaseUrl(): string {
   const value = process.env.DATABASE_URL;
   if (!value) throw new Error("DATABASE_URL is required");
   return value;
 }
 
+// Blocks missing or example secrets before JWTs are issued.
 export function requiredJwtSecret(): string {
   const value = process.env.JWT_SECRET;
   if (!value || value.length < 32 || value.includes("replace_this")) {

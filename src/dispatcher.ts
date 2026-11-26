@@ -2,11 +2,13 @@ import { signWebhook } from "./security.js";
 import { MAX_ATTEMPTS, retryAtFrom } from "./retry.js";
 import type { ClaimedDelivery, Repository } from "./types.js";
 
+// Separates the HTTP call from delivery logic so tests can use a fake receiver.
 export interface DeliveryTransport {
   deliver(destination: string, payload: string, headers: Record<string, string>): Promise<number>;
 }
 
 export const fetchTransport: DeliveryTransport = {
+  // Sends the signed payload with a timeout and without following redirects.
   async deliver(destination, payload, headers) {
     const response = await fetch(destination, {
       method: "POST",
@@ -19,6 +21,7 @@ export const fetchTransport: DeliveryTransport = {
   }
 };
 
+// Sends one claimed job and saves either the success or its next retry time.
 export async function processDelivery(
   repository: Repository,
   delivery: ClaimedDelivery,
@@ -51,6 +54,7 @@ export async function processDelivery(
   }
 }
 
+// Small batches keep one worker from monopolizing the queue.
 export async function processBatch(
   repository: Repository,
   transport: DeliveryTransport = fetchTransport,
@@ -58,7 +62,6 @@ export async function processBatch(
 ): Promise<number> {
   const deliveries = await repository.claimDueDeliveries(limit);
   for (const delivery of deliveries) {
-    // A failed delivery should not stop subsequent jobs in the same batch.
     await processDelivery(repository, delivery, transport);
   }
   return deliveries.length;
