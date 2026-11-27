@@ -90,7 +90,7 @@ curl -X POST http://localhost:3000/v1/events \
   -d '{"type":"order.created","idempotencyKey":"order-10001","payload":{"orderId":"10001"}}'
 ```
 
-Check the attempt history with `GET /v1/deliveries` and the same bearer token. A delivery succeeds on HTTP 2xx. Other responses and network errors are retried, up to five attempts, with a capped backoff.
+Check the attempt history with `GET /v1/deliveries` and the same bearer token. A delivery succeeds on HTTP 2xx. Timeouts, network errors, HTTP 408/425/429, and 5xx responses are retried up to five times. Other 3xx/4xx responses are treated as permanent failures, since sending the same request again usually won't help.
 
 If you post the same event again with the same idempotency key and payload, you get the existing event ID. Changing the payload while reusing the key returns 409.
 
@@ -98,7 +98,9 @@ If you post the same event again with the same idempotency key and payload, you 
 
 I used a separate worker instead of sending webhooks inside the API request because receivers may be slow or unreachable. Publishing the event and enqueuing deliveries happen in one transaction, so a failed write doesn't leave half an event behind.
 
-Two workers can poll at once because Postgres locks claimed rows. A job left in `processing` for over three minutes becomes eligible again. The delivery signature is calculated over the exact serialized JSON body, not a reconstructed object.
+Two workers can poll at once because Postgres locks claimed rows. A job left in `processing` for over three minutes becomes eligible again. Status updates check the attempt number, so a worker holding an expired claim can't overwrite the result of a newer attempt. The delivery signature is calculated over the exact serialized JSON body, not a reconstructed object.
+
+Before each outbound request, the worker resolves the hostname and checks every returned IP address. It connects using one of those checked addresses while keeping the original hostname for TLS verification. This matters because checking DNS and then letting the HTTP client resolve the name again would leave a DNS-rebinding gap. Redirects are not followed.
 
 Relevant files:
 
@@ -106,6 +108,7 @@ Relevant files:
 - [`src/pg-store.ts`](src/pg-store.ts): database queries and job claiming
 - [`src/dispatcher.ts`](src/dispatcher.ts): HTTP calls, signatures, retries
 - [`src/security.ts`](src/security.ts): passwords and webhook URL checks
+- [`src/network.ts`](src/network.ts): outbound IP checks and TLS connections
 
 ## Tests and limits
 
@@ -122,6 +125,6 @@ TEST_DATABASE_URL=postgres://relayforge:your-password@127.0.0.1:5432/relayforge_
 
 Those tests clear tables in the test database. GitHub Actions runs them against a fresh PostgreSQL service.
 
-**Security boundary:** the URL validator rejects obvious private destinations, but it does not prevent DNS rebinding or all SSRF attacks. Do not run the worker with unrestricted public-network access. Before a production deployment, I'd add network-level egress controls, DNS/IP checks at connection time, encrypted signing secrets, delivery metrics, per-tenant quotas, and better worker recovery.
+**Security boundary:** the application rejects private/reserved DNS answers and pins the checked IP for the connection. This reduces the SSRF risk, but application checks alone aren't a replacement for network-level egress restrictions. Don't expose the worker as a public webhook provider yet. A production version would still need egress controls, encrypted signing secrets, delivery metrics, and per-tenant quotas.
 
 MIT license.

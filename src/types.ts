@@ -63,8 +63,8 @@ export interface Repository {
   enqueueEvent(userId: string, event: NewEvent): Promise<QueuedEvent>;
   listDeliveries(userId: string): Promise<DeliverySummary[]>;
   claimDueDeliveries(limit: number): Promise<ClaimedDelivery[]>;
-  markDelivered(id: string, responseCode: number): Promise<void>;
-  markFailed(id: string, responseCode: number | null, reason: string): Promise<void>;
-  markRetrying(id: string, responseCode: number | null, reason: string, retryAt: Date): Promise<void>;
+  markDelivered(id: string, responseCode: number, attempt: number): Promise<void>;
+  markFailed(id: string, responseCode: number | null, reason: string, attempt: number): Promise<void>;
+  markRetrying(id: string, responseCode: number | null, reason: string, retryAt: Date, attempt: number): Promise<void>;
   ping(): Promise<void>;
 }
