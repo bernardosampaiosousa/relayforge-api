@@ -73,7 +73,7 @@ describe("webhook persistence with PostgreSQL", () => {
     expect(claimed).toHaveLength(1);
     expect(claimed[0].attempts).toBe(1);
 
-    await store.markDelivered(claimed[0].id, 200);
+    await store.markDelivered(claimed[0].id, 200, claimed[0].attempts);
     const result = await pool.query("SELECT status, attempts FROM deliveries");
     expect(result.rows[0]).toMatchObject({ status: "delivered", attempts: 1 });
   });
@@ -89,5 +89,25 @@ describe("webhook persistence with PostgreSQL", () => {
     const reclaimed = await store.claimDueDeliveries(1);
     expect(reclaimed).toHaveLength(1);
     expect(reclaimed[0]).toMatchObject({ id: first.id, attempts: 2 });
+  });
+
+  it("ignores status updates from a worker whose claim expired", async () => {
+    await queueOneEvent();
+    const oldClaim = (await store.claimDueDeliveries(1))[0]!;
+    await pool.query(
+      "UPDATE deliveries SET updated_at = now() - INTERVAL '4 minutes' WHERE id = $1",
+      [oldClaim.id]
+    );
+    const newClaim = (await store.claimDueDeliveries(1))[0]!;
+
+    await store.markDelivered(oldClaim.id, 200, oldClaim.attempts);
+    await store.markFailed(oldClaim.id, 500, "stale worker", oldClaim.attempts);
+    await store.markRetrying(oldClaim.id, null, "stale worker", new Date(), oldClaim.attempts);
+    const before = await pool.query("SELECT status, attempts FROM deliveries WHERE id = $1", [oldClaim.id]);
+    expect(before.rows[0]).toMatchObject({ status: "processing", attempts: 2 });
+
+    await store.markDelivered(newClaim.id, 204, newClaim.attempts);
+    const after = await pool.query("SELECT status, response_code FROM deliveries WHERE id = $1", [oldClaim.id]);
+    expect(after.rows[0]).toMatchObject({ status: "delivered", response_code: 204 });
   });
 });

@@ -12,9 +12,9 @@ export class FakeStore implements Repository {
   deliveries: DeliverySummary[] = [];
   deliveryOwners = new Map<string, string>();
   due: ClaimedDelivery[] = [];
-  delivered: { id: string; status: number }[] = [];
-  failed: { id: string; status: number | null; reason: string }[] = [];
-  retrying: { id: string; status: number | null; reason: string; when: Date }[] = [];
+  delivered: { id: string; status: number; attempt: number }[] = [];
+  failed: { id: string; status: number | null; reason: string; attempt: number }[] = [];
+  retrying: { id: string; status: number | null; reason: string; when: Date; attempt: number }[] = [];
 
   async ping(): Promise<void> {}
 
@@ -66,13 +66,13 @@ export class FakeStore implements Repository {
     return this.deliveries.filter(d => this.deliveryOwners.get(d.id) === userId);
   }
   async claimDueDeliveries(limit: number): Promise<ClaimedDelivery[]> { return this.due.splice(0, limit); }
-  async markDelivered(id: string, responseCode: number): Promise<void> {
-    this.delivered.push({ id, status: responseCode });
+  async markDelivered(id: string, responseCode: number, attempt: number): Promise<void> {
+    this.delivered.push({ id, status: responseCode, attempt });
   }
-  async markFailed(id: string, responseCode: number | null, reason: string): Promise<void> {
-    this.failed.push({ id, status: responseCode, reason });
+  async markFailed(id: string, responseCode: number | null, reason: string, attempt: number): Promise<void> {
+    this.failed.push({ id, status: responseCode, reason, attempt });
   }
-  async markRetrying(id: string, responseCode: number | null, reason: string, retryAt: Date): Promise<void> {
-    this.retrying.push({ id, status: responseCode, reason, when: retryAt });
+  async markRetrying(id: string, responseCode: number | null, reason: string, retryAt: Date, attempt: number): Promise<void> {
+    this.retrying.push({ id, status: responseCode, reason, when: retryAt, attempt });
   }
 }

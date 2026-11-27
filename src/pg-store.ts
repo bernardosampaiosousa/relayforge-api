@@ -173,28 +173,32 @@ export class PgStore implements Repository {
     }));
   }
 
-  // Clear the last error once the receiver accepts the webhook.
-  async markDelivered(id: string, responseCode: number): Promise<void> {
+  // A timed-out claim can belong to a different worker now. Only the current
+  // attempt is allowed to change its status, even if an older request finishes later.
+  async markDelivered(id: string, responseCode: number, attempt: number): Promise<void> {
     await this.pool.query(
       `UPDATE deliveries SET status = 'delivered', response_code = $2, last_error = NULL,
-       updated_at = now() WHERE id = $1`, [id, responseCode]
+       updated_at = now() WHERE id = $1 AND status = 'processing' AND attempts = $3`,
+      [id, responseCode, attempt]
     );
   }
 
   // No more retries once the maximum attempt count is reached.
-  async markFailed(id: string, responseCode: number | null, reason: string): Promise<void> {
+  async markFailed(id: string, responseCode: number | null, reason: string, attempt: number): Promise<void> {
     await this.pool.query(
       `UPDATE deliveries SET status = 'failed', response_code = $2, last_error = $3,
-       updated_at = now() WHERE id = $1`, [id, responseCode, reason.slice(0, 500)]
+       updated_at = now() WHERE id = $1 AND status = 'processing' AND attempts = $4`,
+      [id, responseCode, reason.slice(0, 500), attempt]
     );
   }
 
   // Set next_attempt_at so the worker knows when to retry.
-  async markRetrying(id: string, responseCode: number | null, reason: string, retryAt: Date): Promise<void> {
+  async markRetrying(id: string, responseCode: number | null, reason: string, retryAt: Date, attempt: number): Promise<void> {
     await this.pool.query(
       `UPDATE deliveries SET status = 'retrying', response_code = $2, last_error = $3,
-       next_attempt_at = $4, updated_at = now() WHERE id = $1`,
-      [id, responseCode, reason.slice(0, 500), retryAt]
+       next_attempt_at = $4, updated_at = now()
+       WHERE id = $1 AND status = 'processing' AND attempts = $5`,
+      [id, responseCode, reason.slice(0, 500), retryAt, attempt]
     );
   }
 }

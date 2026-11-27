@@ -1,4 +1,5 @@
 import { signWebhook } from "./security.js";
+import { sendWebhook, UnsafeDestinationError } from "./network.js";
 import { MAX_ATTEMPTS, retryAtFrom } from "./retry.js";
 import type { ClaimedDelivery, Repository } from "./types.js";
 
@@ -7,19 +8,11 @@ export interface DeliveryTransport {
   deliver(destination: string, payload: string, headers: Record<string, string>): Promise<number>;
 }
 
-export const fetchTransport: DeliveryTransport = {
-  // Sends the signed payload with a timeout and without following redirects.
-  async deliver(destination, payload, headers) {
-    const response = await fetch(destination, {
-      method: "POST",
-      headers: { "content-type": "application/json", ...headers },
-      body: payload,
-      redirect: "manual",
-      signal: AbortSignal.timeout(6000)
-    });
-    return response.status;
-  }
-};
+export const httpsTransport: DeliveryTransport = { deliver: sendWebhook };
+
+function canRetry(status: number): boolean {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
 
 // Sends one claimed job and saves either the success or its next retry time.
 export async function processDelivery(
@@ -31,6 +24,7 @@ export async function processDelivery(
   const body = JSON.stringify({ id: delivery.eventId, type: delivery.eventType, data: delivery.payload });
   let status: number | null = null;
   let reason = "";
+  let permanentFailure = false;
 
   try {
     status = await transport.deliver(delivery.url, body, {
@@ -39,25 +33,28 @@ export async function processDelivery(
       "x-relayforge-signature": signWebhook(body, delivery.signingSecret)
     });
     if (status >= 200 && status < 300) {
-      await repository.markDelivered(delivery.id, status);
+      await repository.markDelivered(delivery.id, status, delivery.attempts);
       return;
     }
     reason = `Destination returned HTTP ${status}`;
+    // Retrying a permanent 4xx (or a redirect) just repeats the same bad request.
+    permanentFailure = !canRetry(status);
   } catch (error: unknown) {
     reason = error instanceof Error ? error.message : "Delivery failed";
+    permanentFailure = error instanceof UnsafeDestinationError;
   }
 
-  if (delivery.attempts >= MAX_ATTEMPTS) {
-    await repository.markFailed(delivery.id, status, reason);
+  if (permanentFailure || delivery.attempts >= MAX_ATTEMPTS) {
+    await repository.markFailed(delivery.id, status, reason, delivery.attempts);
   } else {
-    await repository.markRetrying(delivery.id, status, reason, retryAtFrom(delivery.attempts, now));
+    await repository.markRetrying(delivery.id, status, reason, retryAtFrom(delivery.attempts, now), delivery.attempts);
   }
 }
 
 // Small batches keep one worker from monopolizing the queue.
 export async function processBatch(
   repository: Repository,
-  transport: DeliveryTransport = fetchTransport,
+  transport: DeliveryTransport = httpsTransport,
   limit = 20
 ): Promise<number> {
   const deliveries = await repository.claimDueDeliveries(limit);

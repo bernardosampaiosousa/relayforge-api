@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { processBatch, processDelivery } from "../src/dispatcher.js";
+import { UnsafeDestinationError } from "../src/network.js";
 import type { ClaimedDelivery } from "../src/types.js";
 import { FakeStore } from "./fake-store.js";
 
@@ -23,7 +24,7 @@ describe("Webhook worker", () => {
       }
     });
     expect(signed).toMatch(/^sha256=/);
-    expect(store.delivered).toEqual([{ id: "delivery-123", status: 204 }]);
+    expect(store.delivered).toEqual([{ id: "delivery-123", status: 204, attempt: 1 }]);
     expect(store.retrying).toEqual([]);
   });
 
@@ -33,13 +34,31 @@ describe("Webhook worker", () => {
     await processDelivery(store, job(2), { async deliver() { return 503; } }, now);
     expect(store.retrying).toHaveLength(1);
     expect(store.retrying[0]?.status).toBe(503);
+    expect(store.retrying[0]?.attempt).toBe(2);
     expect(store.retrying[0]?.when.toISOString()).toBe("2026-11-25T12:02:00.000Z");
   });
 
   it("retries network errors and stops after max attempts", async () => {
     const store = new FakeStore();
     await processDelivery(store, job(5), { async deliver() { throw new Error("timeout"); } });
-    expect(store.failed).toEqual([{ id: "delivery-123", status: null, reason: "timeout" }]);
+    expect(store.failed).toEqual([{ id: "delivery-123", status: null, reason: "timeout", attempt: 5 }]);
+    expect(store.retrying).toEqual([]);
+  });
+
+  it("does not retry permanent HTTP errors or redirects", async () => {
+    const store = new FakeStore();
+    await processDelivery(store, job(), { async deliver() { return 400; } });
+    await processDelivery(store, { ...job(), id: "redirected" }, { async deliver() { return 302; } });
+    expect(store.failed.map(result => result.status)).toEqual([400, 302]);
+    expect(store.retrying).toEqual([]);
+  });
+
+  it("stops immediately if the destination becomes unsafe", async () => {
+    const store = new FakeStore();
+    await processDelivery(store, job(), {
+      async deliver() { throw new UnsafeDestinationError("Destination resolved to a private IP"); }
+    });
+    expect(store.failed[0]).toMatchObject({ status: null, attempt: 1 });
     expect(store.retrying).toEqual([]);
   });
 
